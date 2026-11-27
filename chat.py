@@ -19,6 +19,10 @@ from google.genai.errors import APIError
 from streamlit.errors import StreamlitSecretNotFoundError
 
 MODEL_NAME = "gemini-3.1-flash-lite"
+IMAGE_MODELS = [
+    "gemini-2.5-flash-image",
+    "gemini-3.1-flash-image",
+]
 VIDEO_MODELS = [
     "gemini-omni-1.2-flash",
     "veo-3.1-fast-generate-001",
@@ -358,7 +362,11 @@ def prepare_gemini_turn_payload(messages: list[dict], store: GroupChatStore) -> 
             for att in attachments:
                 parts.extend(_attachment_to_gemini_parts(att, store))
         elif content:
-            parts.append(types.Part.from_text(text=content))
+            # Clean legacy prefixes or JSON media stubs from older chat history so Gemini uses real tools
+            cleaned_hist = re.sub(r"^\s*\[PHILLZ AI\]:\s*", "", content)
+            cleaned_hist = re.sub(r'\{\s*"(?:image|video|audio)"\s*:\s*"[^"]*"\s*\}', "", cleaned_hist).strip()
+            if cleaned_hist:
+                parts.append(types.Part.from_text(text=cleaned_hist))
 
         if not parts:
             continue
@@ -381,17 +389,26 @@ def prepare_gemini_turn_payload(messages: list[dict], store: GroupChatStore) -> 
     return gemini_history, latest_prompt_parts
 
 
-def init_chat_session(client, history: list, room: str):
-    """Create a Gemini chat session aware of all group chat participants."""
-    config = types.GenerateContentConfig(
-        system_instruction=(
-            f"You are {AI_NAME}, a helpful, conversational AI participating in a multi-person "
+def init_chat_session(client, history: list, room: str, tools: list | None = None):
+    """Create a Gemini chat session aware of all group chat participants and media tools."""
+    config_kwargs = {
+        "system_instruction": (
+            f"You are {AI_NAME}, a warm, conversational AI wingman participating in a multi-person "
             f"group chat room named '{room}'. User messages are prefixed with `[Username]:` so "
-            "you know who is speaking. Participants can also share images and files. Address "
-            "participants by name when relevant, remember each person's preferences and context "
-            "separately, and keep replies concise and natural."
+            "you know who is speaking. Never start your own reply with `[PHILLZ AI]:` or any "
+            "bracketed name tag. Participants can share images, audio, videos, and files. "
+            "When someone asks you to generate, draw, create, or show an image or picture, "
+            "ALWAYS call the `create_image` tool instead of outputting JSON or fake links. "
+            "When asked to generate a video, ALWAYS call the `create_video` tool. "
+            "When asked to speak or generate a voice note/audio clip, ALWAYS call the `create_audio` tool. "
+            "Address participants by name when relevant, remember each person's context separately, "
+            "and keep replies concise and natural."
         )
-    )
+    }
+    if tools:
+        config_kwargs["tools"] = tools
+
+    config = types.GenerateContentConfig(**config_kwargs)
     return client.chats.create(
         model=MODEL_NAME,
         config=config,
@@ -403,6 +420,14 @@ def should_ai_respond(prompt_text: str, ai_mode: str) -> bool:
     if ai_mode == "Every message":
         return True
     return bool(re.search(r"(?i)@ai\b", prompt_text))
+
+
+def parse_image_command(prompt_text: str) -> str | None:
+    """Return the image prompt if the user invoked `/image`, otherwise None."""
+    match = re.match(r"^\s*(?:@ai\s+)?/image\b[:\s]*(.*)$", prompt_text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
 def parse_video_command(prompt_text: str) -> str | None:
@@ -430,6 +455,70 @@ def _pcm_to_wav_bytes(raw_pcm: bytes, sample_rate: int = 24000) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(raw_pcm)
     return buf.getvalue()
+
+
+def generate_image_attachment(
+    client,
+    prompt_text: str,
+    model_name: str,
+    store: GroupChatStore,
+    reference_image: tuple[bytes, str] | None = None,
+) -> dict:
+    """Generate or edit an image via Gemini native image generation and store it."""
+    if reference_image is not None:
+        img_bytes, img_mime = reference_image
+        contents = [
+            types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+            prompt_text,
+        ]
+    else:
+        contents = prompt_text
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+    )
+
+    image_data = None
+    image_mime = ""
+    for candidate in getattr(response, "candidates", None) or []:
+        parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data and getattr(inline_data, "data", None):
+                mime = (getattr(inline_data, "mime_type", None) or "").lower()
+                if not mime or mime.startswith("image/"):
+                    image_data = inline_data.data
+                    image_mime = mime or "image/png"
+                    break
+        if image_data:
+            break
+
+    if not image_data:
+        raise RuntimeError("No image was returned by the model.")
+
+    if isinstance(image_data, str):
+        import base64
+        image_data = base64.b64decode(image_data)
+
+    ext_map = {
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "image/png": "png",
+    }
+    ext = ext_map.get(image_mime, "png")
+
+    att = store.save_bytes_attachment(
+        raw_bytes=image_data,
+        file_name=f"art_{uuid.uuid4().hex[:8]}.{ext}",
+        mime_type=image_mime or "image/png",
+    )
+    att["generated"] = True
+    return att
 
 
 def generate_audio_attachment(
@@ -490,11 +579,13 @@ def generate_audio_attachment(
         ext = "wav"
         final_mime = "audio/wav"
 
-    return store.save_bytes_attachment(
+    att = store.save_bytes_attachment(
         raw_bytes=final_bytes,
         file_name=f"voice_{uuid.uuid4().hex[:8]}.{ext}",
         mime_type=final_mime,
     )
+    att["generated"] = True
+    return att
 
 
 def generate_video_attachment(
@@ -554,11 +645,118 @@ def generate_video_attachment(
         except Exception:
             pass
 
-    return store.save_bytes_attachment(
+    att = store.save_bytes_attachment(
         raw_bytes=video_bytes,
         file_name=f"veo_{uuid.uuid4().hex[:8]}.mp4",
         mime_type="video/mp4",
     )
+    att["generated"] = True
+    return att
+
+
+def build_ai_media_tools(
+    client,
+    store: GroupChatStore,
+    image_model: str,
+    video_model: str,
+    video_aspect_ratio: str,
+    audio_model: str,
+    audio_voice: str,
+    generated_attachments: list,
+    attached_image: tuple[bytes, str] | None = None,
+    status_placeholder=None,
+) -> list:
+    """Build automatic Gemini function-calling tools for image, video, and audio generation."""
+
+    def create_image(prompt: str, use_attached_photo: bool = False) -> str:
+        """Generate a romantic or custom image and display it in a framed output box in chat.
+
+        Args:
+            prompt: Detailed visual description of the image to generate or edit.
+            use_attached_photo: Set True only if editing or transforming a photo the user just uploaded.
+        """
+        if status_placeholder is not None:
+            status_placeholder.caption(f"🎨 Painting image with {image_model}...")
+        try:
+            ref = attached_image if use_attached_photo else None
+            att = generate_image_attachment(
+                client=client,
+                prompt_text=prompt,
+                model_name=image_model,
+                store=store,
+                reference_image=ref,
+            )
+            generated_attachments.append(att)
+            return "Success: the generated image is ready and will be shown in the output frame."
+        except Exception as exc:
+            return f"Image generation failed: {exc}"
+
+    def create_video(prompt: str, use_attached_photo: bool = False) -> str:
+        """Generate a short video clip and display it in a framed video player in chat.
+
+        Args:
+            prompt: Detailed scene and motion description for the video.
+            use_attached_photo: Set True only if animating a photo the user just uploaded.
+        """
+        if status_placeholder is not None:
+            status_placeholder.caption(f"🎬 Generating video with {video_model}...")
+        try:
+            ref = attached_image if use_attached_photo else None
+            att = generate_video_attachment(
+                client=client,
+                prompt_text=prompt,
+                model_name=video_model,
+                aspect_ratio=video_aspect_ratio,
+                store=store,
+                reference_image=ref,
+            )
+            generated_attachments.append(att)
+            return "Success: the generated video is ready and will be shown in the output frame."
+        except Exception as exc:
+            return f"Video generation failed: {exc}"
+
+    def create_audio(spoken_text: str) -> str:
+        """Generate a spoken voice note audio clip and display it in the chat audio player.
+
+        Args:
+            spoken_text: Exact words to speak aloud, optionally starting with a tone cue like 'Say warmly: ...'.
+        """
+        if status_placeholder is not None:
+            status_placeholder.caption(f"🎙️ Recording voice note ({audio_voice})...")
+        try:
+            att = generate_audio_attachment(
+                client=client,
+                text_prompt=spoken_text,
+                model_name=audio_model,
+                voice_name=audio_voice,
+                store=store,
+            )
+            generated_attachments.append(att)
+            return "Success: the audio voice note is ready and will be shown in the output frame."
+        except Exception as exc:
+            return f"Audio generation failed: {exc}"
+
+    return [create_image, create_video, create_audio]
+
+
+CONTAINER_SUPPORTS_BORDER = "border" in inspect.signature(st.container).parameters
+
+
+def _render_media_frame(badge_text: str, render_fn) -> None:
+    """Render media inside a styled output frame container when supported."""
+    if CONTAINER_SUPPORTS_BORDER:
+        with st.container(border=True):
+            st.markdown(
+                f'<span class="media-frame-badge">{html.escape(badge_text)}</span>',
+                unsafe_allow_html=True,
+            )
+            render_fn()
+    else:
+        st.markdown(
+            f'<span class="media-frame-badge">{html.escape(badge_text)}</span>',
+            unsafe_allow_html=True,
+        )
+        render_fn()
 
 
 def _render_attachments(msg: dict, store: GroupChatStore, key_prefix: str) -> None:
@@ -567,36 +765,59 @@ def _render_attachments(msg: dict, store: GroupChatStore, key_prefix: str) -> No
         att_id = att.get("id", str(idx))
         name = att.get("name", "attachment")
         mime_type = (att.get("mime_type") or "").lower()
+        is_generated = bool(att.get("generated"))
         raw_bytes = store.get_file_bytes(att_id, att.get("stored_name"))
 
         if not raw_bytes:
             st.caption(f"📎 {name} *(expired after restart)*")
             continue
 
+        size_label = _format_file_size(att.get("size", len(raw_bytes)))
+
         if mime_type.startswith("image/"):
-            st.image(raw_bytes, caption=name)
+            badge = "🎨 AI Creation" if is_generated else "🖼️ Shared Photo"
+
+            def _draw_image():
+                st.image(raw_bytes, caption=None if is_generated else name)
+                if is_generated:
+                    st.download_button(
+                        label=f"⬇️ Save image ({size_label})",
+                        data=raw_bytes,
+                        file_name=name,
+                        mime=mime_type or "image/png",
+                        key=f"{key_prefix}_{msg_id}_{att_id}_{idx}_dl",
+                    )
+
+            _render_media_frame(badge, _draw_image)
         elif mime_type.startswith("audio/"):
-            st.audio(raw_bytes, format=mime_type or "audio/wav")
-            size_label = _format_file_size(att.get("size", len(raw_bytes)))
-            st.download_button(
-                label=f"⬇️ Save {name} ({size_label})",
-                data=raw_bytes,
-                file_name=name,
-                mime=mime_type or "audio/wav",
-                key=f"{key_prefix}_{msg_id}_{att_id}_{idx}_dl",
-            )
+            badge = "🎙️ AI Voice Note" if is_generated else "🎵 Shared Audio"
+
+            def _draw_audio():
+                st.audio(raw_bytes, format=mime_type or "audio/wav")
+                st.download_button(
+                    label=f"⬇️ Save {name} ({size_label})",
+                    data=raw_bytes,
+                    file_name=name,
+                    mime=mime_type or "audio/wav",
+                    key=f"{key_prefix}_{msg_id}_{att_id}_{idx}_dl",
+                )
+
+            _render_media_frame(badge, _draw_audio)
         elif mime_type.startswith("video/"):
-            st.video(raw_bytes)
-            size_label = _format_file_size(att.get("size", len(raw_bytes)))
-            st.download_button(
-                label=f"⬇️ Save {name} ({size_label})",
-                data=raw_bytes,
-                file_name=name,
-                mime=mime_type or "video/mp4",
-                key=f"{key_prefix}_{msg_id}_{att_id}_{idx}_dl",
-            )
+            badge = "🎬 AI Video" if is_generated else "🎥 Shared Video"
+
+            def _draw_video():
+                st.video(raw_bytes)
+                st.download_button(
+                    label=f"⬇️ Save {name} ({size_label})",
+                    data=raw_bytes,
+                    file_name=name,
+                    mime=mime_type or "video/mp4",
+                    key=f"{key_prefix}_{msg_id}_{att_id}_{idx}_dl",
+                )
+
+            _render_media_frame(badge, _draw_video)
         else:
-            size_label = _format_file_size(att.get("size", len(raw_bytes)))
             st.download_button(
                 label=f"📄 {name} ({size_label})",
                 data=raw_bytes,
@@ -908,14 +1129,34 @@ st.markdown(
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28) !important;
     }
 
+    /* Framed Media Output Card inside chat bubbles */
+    [data-testid="stChatMessage"] [data-testid="stVerticalBlockBorderWrapper"] {
+        background: linear-gradient(145deg, rgba(35, 13, 28, 0.92), rgba(22, 8, 18, 0.96)) !important;
+        border: 1px solid rgba(244, 196, 148, 0.38) !important;
+        border-radius: 16px !important;
+        padding: 10px 12px !important;
+        margin-top: 8px !important;
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+    }
+
+    .media-frame-badge {
+        font-size: 0.72rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.04em !important;
+        text-transform: uppercase !important;
+        color: #f4c494 !important;
+        margin-bottom: 6px !important;
+        display: block !important;
+    }
+
     /* Rounded images and videos in messages */
     [data-testid="stChatMessage"] img,
     [data-testid="stChatMessage"] [data-testid="stImage"] img {
-        border-radius: 14px !important;
+        border-radius: 12px !important;
         max-width: min(320px, 100%) !important;
         width: auto !important;
         height: auto !important;
-        margin-top: 6px !important;
+        margin-top: 2px !important;
     }
 
     [data-testid="stChatMessage"] video {
@@ -1022,6 +1263,9 @@ if "room" not in st.session_state:
 if "ai_mode" not in st.session_state:
     st.session_state.ai_mode = "Every message"
 
+if "image_model" not in st.session_state:
+    st.session_state.image_model = IMAGE_MODELS[0]
+
 if "video_model" not in st.session_state:
     st.session_state.video_model = VIDEO_MODELS[0]
 
@@ -1058,7 +1302,7 @@ st.markdown(
             </div>
         </div>
         <div style="font-size: 0.78rem; color: #f4c494; background: rgba(244, 196, 148, 0.12); border: 1px solid rgba(244, 196, 148, 0.28); padding: 5px 12px; border-radius: 999px; font-weight: 600;">
-            💘 Cupid Online
+            💘 Cupid · Studio Ready
         </div>
     </div>
     """,
@@ -1149,6 +1393,17 @@ with st.sidebar:
         options=["Every message", "Only when @ai is mentioned"],
         index=0 if st.session_state.ai_mode == "Every message" else 1,
     )
+
+    st.divider()
+    st.subheader("Image Studio 🎨")
+    st.session_state.image_model = st.selectbox(
+        "Image model",
+        options=IMAGE_MODELS,
+        index=IMAGE_MODELS.index(st.session_state.image_model)
+        if st.session_state.image_model in IMAGE_MODELS
+        else 0,
+    )
+    st.caption("Ask naturally (e.g. *generate a rose*) or type `/image <prompt>`.")
 
     st.divider()
     st.subheader("Video Studio 🎬")
@@ -1253,9 +1508,9 @@ if not CHAT_INPUT_SUPPORTS_FILES:
         ) or []
 
 placeholder_text = (
-    f"Message #{room}, attach 📎, /audio <text>, or /video <scene>..."
+    f"Message #{room}, attach 📎, or ask for an image, video, or voice note..."
     if st.session_state.ai_mode == "Every message"
-    else f"Message #{room}, attach 📎, @ai, /audio, or /video..."
+    else f"Message #{room}, attach 📎, @ai, /image, /audio, or /video..."
 )
 
 if CHAT_INPUT_SUPPORTS_FILES:
@@ -1294,8 +1549,19 @@ if prompt:
     if not CHAT_INPUT_SUPPORTS_FILES and fallback_uploads:
         st.session_state.uploader_nonce += 1
 
+    image_prompt = parse_image_command(prompt_text)
     video_prompt = parse_video_command(prompt_text)
     audio_prompt = parse_audio_command(prompt_text)
+
+    first_image = next(
+        (a for a in attachments if (a.get("mime_type") or "").startswith("image/")),
+        None,
+    )
+    attached_ref_image = None
+    if first_image is not None:
+        img_bytes = store.get_file_bytes(first_image["id"], first_image.get("stored_name"))
+        if img_bytes:
+            attached_ref_image = (img_bytes, first_image["mime_type"])
 
     now_str = datetime.now().strftime("%H:%M")
     user_msg = {
@@ -1308,6 +1574,61 @@ if prompt:
         "attachments": attachments,
     }
     store.add_message(room, user_msg)
+
+    if image_prompt is not None:
+        render_message(user_msg, current_user=username, store=store, key_prefix="preview")
+
+        if not image_prompt:
+            st.warning(
+                "Describe the image after `/image` "
+                "(for example: `/image a single vibrant red rose with dew drops`)."
+            )
+            st.stop()
+
+        if not api_key:
+            st.info(
+                "Gemini is not configured yet. Add `GEMINI_API_KEY` in Secrets or environment variables."
+            )
+            st.stop()
+
+        with st.chat_message("assistant", avatar="💘"):
+            st.markdown(
+                f'<div class="msg-header msg-ai">'
+                f'<span class="msg-sender" style="color: {AI_COLOR};">{AI_NAME} · Wingman</span>'
+                f'<span class="msg-time">{datetime.now().strftime("%H:%M")}</span></div>',
+                unsafe_allow_html=True,
+            )
+            with st.spinner(f"🎨 Creating image with {st.session_state.image_model}..."):
+                try:
+                    if st.session_state.client is None:
+                        st.session_state.client = genai.Client(api_key=api_key)
+
+                    image_att = generate_image_attachment(
+                        client=st.session_state.client,
+                        prompt_text=image_prompt,
+                        model_name=st.session_state.image_model,
+                        store=store,
+                        reference_image=attached_ref_image,
+                    )
+                except APIError as error:
+                    st.error(f"Image generation failed: {error}")
+                except Exception as error:
+                    st.error(f"Could not generate image: {error}")
+                else:
+                    store.add_message(
+                        room,
+                        {
+                            "id": uuid.uuid4().hex[:12],
+                            "role": "assistant",
+                            "sender": AI_NAME,
+                            "color": AI_COLOR,
+                            "timestamp": datetime.now().strftime("%H:%M"),
+                            "content": f"🎨 Created for you: *{image_prompt}*",
+                            "attachments": [image_att],
+                        },
+                    )
+                    st.rerun()
+        st.stop()
 
     if audio_prompt is not None:
         render_message(user_msg, current_user=username, store=store, key_prefix="preview")
@@ -1465,8 +1786,10 @@ if prompt:
             f'<span class="msg-time">{datetime.now().strftime("%H:%M")}</span></div>',
             unsafe_allow_html=True,
         )
+        status_placeholder = st.empty()
         response_placeholder = st.empty()
         full_response = ""
+        generated_attachments = []
 
         try:
             if st.session_state.client is None:
@@ -1474,29 +1797,99 @@ if prompt:
 
             latest_messages = store.get_messages(room)
             history, latest_user_parts = prepare_gemini_turn_payload(latest_messages, store)
-            chat = init_chat_session(st.session_state.client, history, room)
+            media_tools = build_ai_media_tools(
+                client=st.session_state.client,
+                store=store,
+                image_model=st.session_state.image_model,
+                video_model=st.session_state.video_model,
+                video_aspect_ratio=st.session_state.video_aspect_ratio,
+                audio_model=st.session_state.audio_model,
+                audio_voice=st.session_state.audio_voice,
+                generated_attachments=generated_attachments,
+                attached_image=attached_ref_image,
+                status_placeholder=status_placeholder,
+            )
+            chat = init_chat_session(st.session_state.client, history, room, tools=media_tools)
 
             for chunk in chat.send_message_stream(latest_user_parts):
                 chunk_text = getattr(chunk, "text", None)
                 if chunk_text:
                     full_response += chunk_text
-                    response_placeholder.markdown(full_response + "▌")
+                    cleaned_preview = re.sub(r"^\s*\[PHILLZ AI\]:\s*", "", full_response)
+                    response_placeholder.markdown(cleaned_preview + "▌")
+
+            status_placeholder.empty()
+            full_response = re.sub(r"^\s*\[PHILLZ AI\]:\s*", "", full_response).strip()
+
+            # Fallback: if model still emitted {"image": "..."} text, extract it and generate the real media
+            json_media_match = re.search(
+                r'\{\s*"(image|video|audio)"\s*:\s*"([^"]+)"\s*\}',
+                full_response,
+            )
+            if json_media_match and not generated_attachments:
+                media_kind, media_prompt = json_media_match.group(1), json_media_match.group(2)
+                full_response = (
+                    full_response[: json_media_match.start()]
+                    + full_response[json_media_match.end() :]
+                ).strip()
+                try:
+                    if media_kind == "image":
+                        generated_attachments.append(
+                            generate_image_attachment(
+                                client=st.session_state.client,
+                                prompt_text=media_prompt,
+                                model_name=st.session_state.image_model,
+                                store=store,
+                                reference_image=attached_ref_image,
+                            )
+                        )
+                    elif media_kind == "video":
+                        generated_attachments.append(
+                            generate_video_attachment(
+                                client=st.session_state.client,
+                                prompt_text=media_prompt,
+                                model_name=st.session_state.video_model,
+                                aspect_ratio=st.session_state.video_aspect_ratio,
+                                store=store,
+                                reference_image=attached_ref_image,
+                            )
+                        )
+                    elif media_kind == "audio":
+                        generated_attachments.append(
+                            generate_audio_attachment(
+                                client=st.session_state.client,
+                                text_prompt=media_prompt,
+                                model_name=st.session_state.audio_model,
+                                voice_name=st.session_state.audio_voice,
+                                store=store,
+                            )
+                        )
+                except Exception as media_err:
+                    st.warning(f"Could not render {media_kind}: {media_err}")
 
             if full_response:
+                response_placeholder.markdown(full_response)
+            elif generated_attachments:
+                full_response = "Here you go! ✨"
                 response_placeholder.markdown(full_response)
             else:
                 full_response = "Gemini returned no text for that prompt."
                 response_placeholder.markdown(full_response)
         except APIError as error:
+            status_placeholder.empty()
             response_placeholder.empty()
             st.error(f"Gemini request failed: {error}")
         except RuntimeError:
+            status_placeholder.empty()
             response_placeholder.empty()
             st.session_state.client = genai.Client(api_key=api_key)
             st.warning("Connection reset. Please send your message again.")
         else:
-            reply_attachments = []
-            if st.session_state.auto_voice_replies and full_response:
+            reply_attachments = list(generated_attachments)
+            has_audio_already = any(
+                (a.get("mime_type") or "").startswith("audio/") for a in reply_attachments
+            )
+            if st.session_state.auto_voice_replies and full_response and not has_audio_already:
                 try:
                     voice_att = generate_audio_attachment(
                         client=st.session_state.client,
