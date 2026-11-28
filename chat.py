@@ -13,6 +13,7 @@ import zlib
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -169,6 +170,7 @@ class GroupChatStore:
         self.upload_dir = upload_dir
         self.lock = threading.Lock()
         self.file_blobs: dict[str, bytes] = {}
+        self.typing_users: dict[str, dict[str, dict]] = {}
         self.rooms: dict[str, list[dict]] = self._load_from_disk()
 
     def _load_from_disk(self) -> dict[str, list[dict]]:
@@ -272,6 +274,7 @@ class GroupChatStore:
         with self.lock:
             removed_msgs = self.rooms.get(room, [])
             self.rooms[room] = []
+            self.typing_users.pop(room, None)
             self._save_to_disk()
 
             still_referenced = {
@@ -304,6 +307,39 @@ class GroupChatStore:
                     if sender not in seen:
                         seen[sender] = msg.get("color") or get_user_style(sender)[0]
         return list(seen.items())
+
+    def set_typing(
+        self,
+        room: str,
+        sender: str,
+        action: str = "typing",
+        color: str = "#ff6b9d",
+        ttl_seconds: float = 5.5,
+    ) -> None:
+        expires_at = time.monotonic() + ttl_seconds
+        with self.lock:
+            room_typers = self.typing_users.setdefault(room, {})
+            room_typers[sender] = {
+                "sender": sender,
+                "action": action,
+                "color": color,
+                "expires_at": expires_at,
+            }
+
+    def clear_typing(self, room: str, sender: str) -> None:
+        with self.lock:
+            room_typers = self.typing_users.get(room)
+            if room_typers:
+                room_typers.pop(sender, None)
+
+    def get_active_typers(self, room: str) -> list[dict]:
+        now = time.monotonic()
+        with self.lock:
+            room_typers = self.typing_users.get(room, {})
+            expired = [name for name, info in room_typers.items() if info["expires_at"] <= now]
+            for name in expired:
+                room_typers.pop(name, None)
+            return [dict(info) for info in room_typers.values()]
 
 
 @st.cache_resource
@@ -596,6 +632,7 @@ def generate_video_attachment(
     store: GroupChatStore,
     reference_image: tuple[bytes, str] | None = None,
     status_container=None,
+    heartbeat_fn=None,
 ) -> dict:
     """Generate a video via Gemini Veo and store it in GroupChatStore."""
     kwargs = {
@@ -614,6 +651,8 @@ def generate_video_attachment(
     for _ in range(max_polls):
         if getattr(operation, "done", False):
             break
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         if status_container is not None:
             status_container.write(f"Rendering video frames... ({elapsed}s elapsed)")
         time.sleep(8)
@@ -657,6 +696,7 @@ def generate_video_attachment(
 def build_ai_media_tools(
     client,
     store: GroupChatStore,
+    room: str,
     image_model: str,
     video_model: str,
     video_aspect_ratio: str,
@@ -675,6 +715,7 @@ def build_ai_media_tools(
             prompt: Detailed visual description of the image to generate or edit.
             use_attached_photo: Set True only if editing or transforming a photo the user just uploaded.
         """
+        store.set_typing(room, AI_NAME, action="painting an image", color=AI_COLOR, ttl_seconds=35.0)
         if status_placeholder is not None:
             status_placeholder.caption(f"🎨 Painting image with {image_model}...")
         try:
@@ -698,6 +739,7 @@ def build_ai_media_tools(
             prompt: Detailed scene and motion description for the video.
             use_attached_photo: Set True only if animating a photo the user just uploaded.
         """
+        store.set_typing(room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0)
         if status_placeholder is not None:
             status_placeholder.caption(f"🎬 Generating video with {video_model}...")
         try:
@@ -709,6 +751,9 @@ def build_ai_media_tools(
                 aspect_ratio=video_aspect_ratio,
                 store=store,
                 reference_image=ref,
+                heartbeat_fn=lambda: store.set_typing(
+                    room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0
+                ),
             )
             generated_attachments.append(att)
             return "Success: the generated video is ready and will be shown in the output frame."
@@ -721,6 +766,7 @@ def build_ai_media_tools(
         Args:
             spoken_text: Exact words to speak aloud, optionally starting with a tone cue like 'Say warmly: ...'.
         """
+        store.set_typing(room, AI_NAME, action="recording a voice note", color=AI_COLOR, ttl_seconds=35.0)
         if status_placeholder is not None:
             status_placeholder.caption(f"🎙️ Recording voice note ({audio_voice})...")
         try:
@@ -737,6 +783,134 @@ def build_ai_media_tools(
             return f"Audio generation failed: {exc}"
 
     return [create_image, create_video, create_audio]
+
+
+def render_typing_notice(active_typers: list[dict], current_user: str, room: str) -> None:
+    """Display live typing indicators for AI, other users, and self confirmation."""
+    other_typers = [t for t in active_typers if t.get("sender") != current_user]
+    self_typing = any(t.get("sender") == current_user for t in active_typers)
+
+    if other_typers:
+        rows_html = []
+        for typer in other_typers:
+            sender = typer.get("sender", "Someone")
+            action = typer.get("action", "typing")
+            color = typer.get("color") or AI_COLOR
+            if sender == AI_NAME:
+                avatar_html = "💘"
+                label = f"{AI_NAME} · Wingman"
+            else:
+                _, avatar_html = get_user_style(sender)
+                label = sender
+            rows_html.append(
+                f'<div class="typing-banner">'
+                f'<span class="typing-avatar">{avatar_html}</span>'
+                f'<span style="color:{html.escape(color)};font-weight:700;">{html.escape(label)}</span>'
+                f'<span class="typing-action">is {html.escape(action)}</span>'
+                f'<span class="typing-dots"><span></span><span></span><span></span></span>'
+                f"</div>"
+            )
+        st.markdown("".join(rows_html), unsafe_allow_html=True)
+
+    if self_typing:
+        st.markdown(
+            f'<div class="typing-self-pill">✍️ Others in #{html.escape(room)} can see you\'re typing...</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def mount_keyboard_typing_listener() -> None:
+    """Attach a throttled JS keystroke listener to st.chat_input that pings the fragment."""
+    components.html(
+        """
+        <script>
+        (function () {
+            let parentDoc;
+            try {
+                parentDoc = window.parent.document;
+            } catch (err) {
+                return;
+            }
+            if (!parentDoc) return;
+
+            const STATE_KEY = "__phillzTypingState";
+            const win = window.parent;
+            if (!win[STATE_KEY]) {
+                win[STATE_KEY] = { lastPing: 0, wasTyping: false };
+            }
+            const state = win[STATE_KEY];
+
+            function findButton(label) {
+                const buttons = parentDoc.querySelectorAll("button");
+                for (let i = 0; i < buttons.length; i++) {
+                    if ((buttons[i].innerText || "").trim() === label) {
+                        return buttons[i];
+                    }
+                }
+                return null;
+            }
+
+            function triggerButton(label, ta) {
+                const btn = findButton(label);
+                if (!btn) return;
+                const selStart = ta.selectionStart;
+                const selEnd = ta.selectionEnd;
+                btn.click();
+                win.requestAnimationFrame(function () {
+                    const activeTa = parentDoc.querySelector('[data-testid="stChatInput"] textarea');
+                    if (activeTa && parentDoc.activeElement !== activeTa) {
+                        try {
+                            activeTa.focus({ preventScroll: true });
+                            if (typeof selStart === "number" && typeof selEnd === "number") {
+                                activeTa.setSelectionRange(selStart, selEnd);
+                            }
+                        } catch (e) {}
+                    }
+                });
+            }
+
+            function bindChatInput() {
+                const ta = parentDoc.querySelector('[data-testid="stChatInput"] textarea');
+                if (!ta || ta.dataset.phTypingBound === "1") return;
+                ta.dataset.phTypingBound = "1";
+
+                ta.addEventListener("input", function () {
+                    const hasText = ta.value.trim().length > 0;
+                    const now = Date.now();
+                    if (hasText) {
+                        state.wasTyping = true;
+                        if (now - state.lastPing > 2200) {
+                            state.lastPing = now;
+                            triggerButton("__typing_ping__", ta);
+                        }
+                    } else if (state.wasTyping) {
+                        state.wasTyping = false;
+                        state.lastPing = 0;
+                        triggerButton("__typing_stop__", ta);
+                    }
+                });
+
+                ta.addEventListener("keydown", function (e) {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                        state.wasTyping = false;
+                        state.lastPing = 0;
+                    }
+                });
+            }
+
+            bindChatInput();
+            if (!win.__phillzTypingObserver) {
+                win.__phillzTypingObserver = new MutationObserver(bindChatInput);
+                win.__phillzTypingObserver.observe(parentDoc.body, {
+                    childList: true,
+                    subtree: true
+                });
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 CONTAINER_SUPPORTS_BORDER = "border" in inspect.signature(st.container).parameters
@@ -1235,6 +1409,90 @@ st.markdown(
         animation: pulseGlow 2.2s infinite;
     }
 
+    /* ========================================================
+       REAL-TIME TYPING INDICATORS & HIDDEN KEYBOARD BRIDGE
+       ======================================================== */
+    .typing-banner {
+        display: inline-flex !important;
+        align-items: center !important;
+        gap: 8px !important;
+        padding: 7px 14px !important;
+        margin: 4px 8px 6px 0 !important;
+        border-radius: 18px !important;
+        background: rgba(46, 20, 38, 0.85) !important;
+        border: 1px solid rgba(255, 143, 171, 0.28) !important;
+        font-size: 0.83rem !important;
+        color: #fce7f3 !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25) !important;
+        backdrop-filter: blur(8px) !important;
+    }
+
+    .typing-avatar {
+        font-size: 0.95rem !important;
+    }
+
+    .typing-action {
+        color: #f9a8d4 !important;
+        font-style: italic !important;
+    }
+
+    .typing-dots {
+        display: inline-flex !important;
+        align-items: center !important;
+        gap: 3px !important;
+        margin-left: 2px !important;
+    }
+
+    .typing-dots span {
+        width: 5px !important;
+        height: 5px !important;
+        border-radius: 50% !important;
+        background-color: #ff6b9d !important;
+        animation: typingBounce 1.2s infinite ease-in-out !important;
+    }
+
+    .typing-dots span:nth-child(2) {
+        animation-delay: 0.18s !important;
+    }
+
+    .typing-dots span:nth-child(3) {
+        animation-delay: 0.36s !important;
+    }
+
+    @keyframes typingBounce {
+        0%, 80%, 100% {
+            transform: translateY(0);
+            opacity: 0.4;
+        }
+        40% {
+            transform: translateY(-4px);
+            opacity: 1;
+        }
+    }
+
+    .typing-self-pill {
+        font-size: 0.74rem !important;
+        color: #f9a8d4 !important;
+        opacity: 0.85 !important;
+        margin: 2px 0 8px 4px !important;
+        text-align: right !important;
+    }
+
+    [data-testid="stVerticalBlock"]:has(.ph-hidden-typing-bridge),
+    [data-testid="stLayoutWrapper"]:has(.ph-hidden-typing-bridge),
+    [data-testid="stIFrame"]:has(iframe[height="0"]) {
+        position: fixed !important;
+        left: -9999px !important;
+        top: -9999px !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
     /* Mobile screens */
     @media (max-width: 640px) {
         [data-testid="stChatMessage"]:has(.msg-self),
@@ -1456,25 +1714,43 @@ with st.sidebar:
 
 
 def _render_chat_feed() -> None:
-    current_messages = store.get_messages(st.session_state.room)
+    current_room = st.session_state.room
+    current_user = st.session_state.username
+    current_messages = store.get_messages(current_room)
     for message in current_messages:
         render_message(
             message,
-            current_user=st.session_state.username,
+            current_user=current_user,
             store=store,
             key_prefix="feed",
         )
     if not current_messages:
         st.markdown("### Break the ice 🥂")
         st.caption(
-            f"Invite others to `#{st.session_state.room}` (`?room={st.session_state.room}`) "
+            f"Invite others to `#{current_room}` (`?room={current_room}`) "
             "and let the conversation spark."
         )
+    render_typing_notice(store.get_active_typers(current_room), current_user, current_room)
 
 
 if hasattr(st, "fragment"):
-    @st.fragment(run_every="2s")
+    @st.fragment(run_every="1.5s")
     def render_live_chat_feed() -> None:
+        with st.container():
+            st.markdown('<span class="ph-hidden-typing-bridge"></span>', unsafe_allow_html=True)
+            c_ping, c_stop = st.columns(2)
+            with c_ping:
+                if st.button("__typing_ping__", key="ph_typing_ping"):
+                    store.set_typing(
+                        st.session_state.room,
+                        st.session_state.username,
+                        action="typing",
+                        color=get_user_style(st.session_state.username)[0],
+                        ttl_seconds=5.5,
+                    )
+            with c_stop:
+                if st.button("__typing_stop__", key="ph_typing_stop"):
+                    store.clear_typing(st.session_state.room, st.session_state.username)
         _render_chat_feed()
 
     render_live_chat_feed()
@@ -1521,6 +1797,9 @@ if CHAT_INPUT_SUPPORTS_FILES:
     )
 else:
     prompt = st.chat_input(placeholder_text)
+
+if hasattr(st, "fragment"):
+    mount_keyboard_typing_listener()
 
 if prompt:
     if hasattr(prompt, "text") or hasattr(prompt, "files"):
@@ -1574,6 +1853,7 @@ if prompt:
         "attachments": attachments,
     }
     store.add_message(room, user_msg)
+    store.clear_typing(room, username)
 
     if image_prompt is not None:
         render_message(user_msg, current_user=username, store=store, key_prefix="preview")
@@ -1598,6 +1878,7 @@ if prompt:
                 f'<span class="msg-time">{datetime.now().strftime("%H:%M")}</span></div>',
                 unsafe_allow_html=True,
             )
+            store.set_typing(room, AI_NAME, action="painting an image", color=AI_COLOR, ttl_seconds=35.0)
             with st.spinner(f"🎨 Creating image with {st.session_state.image_model}..."):
                 try:
                     if st.session_state.client is None:
@@ -1627,7 +1908,10 @@ if prompt:
                             "attachments": [image_att],
                         },
                     )
+                    store.clear_typing(room, AI_NAME)
                     st.rerun()
+                finally:
+                    store.clear_typing(room, AI_NAME)
         st.stop()
 
     if audio_prompt is not None:
@@ -1653,6 +1937,7 @@ if prompt:
                 f'<span class="msg-time">{datetime.now().strftime("%H:%M")}</span></div>',
                 unsafe_allow_html=True,
             )
+            store.set_typing(room, AI_NAME, action="recording a voice note", color=AI_COLOR, ttl_seconds=35.0)
             with st.spinner(f"🎙️ Generating voice note ({st.session_state.audio_voice})..."):
                 try:
                     if st.session_state.client is None:
@@ -1682,7 +1967,10 @@ if prompt:
                             "attachments": [audio_att],
                         },
                     )
+                    store.clear_typing(room, AI_NAME)
                     st.rerun()
+                finally:
+                    store.clear_typing(room, AI_NAME)
         st.stop()
 
     if video_prompt is not None:
@@ -1716,6 +2004,7 @@ if prompt:
                 f'<span class="msg-time">{datetime.now().strftime("%H:%M")}</span></div>',
                 unsafe_allow_html=True,
             )
+            store.set_typing(room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0)
             with st.status(
                 f"🎬 Creating video with {st.session_state.video_model}...",
                 expanded=True,
@@ -1740,6 +2029,9 @@ if prompt:
                         store=store,
                         reference_image=ref_image,
                         status_container=status,
+                        heartbeat_fn=lambda: store.set_typing(
+                            room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0
+                        ),
                     )
                 except APIError as error:
                     status.update(label="Video generation failed", state="error")
@@ -1764,7 +2056,10 @@ if prompt:
                             "attachments": [video_att],
                         },
                     )
+                    store.clear_typing(room, AI_NAME)
                     st.rerun()
+                finally:
+                    store.clear_typing(room, AI_NAME)
         st.stop()
 
     if not should_ai_respond(prompt_text, st.session_state.ai_mode):
@@ -1787,10 +2082,19 @@ if prompt:
             unsafe_allow_html=True,
         )
         status_placeholder = st.empty()
+        status_placeholder.markdown(
+            '<div class="typing-banner">'
+            f'<span style="color:{AI_COLOR};font-weight:700;">{AI_NAME}</span>'
+            '<span class="typing-action">is typing</span>'
+            '<span class="typing-dots"><span></span><span></span><span></span></span>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
         response_placeholder = st.empty()
         full_response = ""
         generated_attachments = []
 
+        store.set_typing(room, AI_NAME, action="typing", color=AI_COLOR, ttl_seconds=30.0)
         try:
             if st.session_state.client is None:
                 st.session_state.client = genai.Client(api_key=api_key)
@@ -1800,6 +2104,7 @@ if prompt:
             media_tools = build_ai_media_tools(
                 client=st.session_state.client,
                 store=store,
+                room=room,
                 image_model=st.session_state.image_model,
                 video_model=st.session_state.video_model,
                 video_aspect_ratio=st.session_state.video_aspect_ratio,
@@ -1814,9 +2119,12 @@ if prompt:
             for chunk in chat.send_message_stream(latest_user_parts):
                 chunk_text = getattr(chunk, "text", None)
                 if chunk_text:
+                    if not full_response:
+                        status_placeholder.empty()
                     full_response += chunk_text
                     cleaned_preview = re.sub(r"^\s*\[PHILLZ AI\]:\s*", "", full_response)
                     response_placeholder.markdown(cleaned_preview + "▌")
+                    store.set_typing(room, AI_NAME, action="typing", color=AI_COLOR, ttl_seconds=20.0)
 
             status_placeholder.empty()
             full_response = re.sub(r"^\s*\[PHILLZ AI\]:\s*", "", full_response).strip()
@@ -1834,6 +2142,7 @@ if prompt:
                 ).strip()
                 try:
                     if media_kind == "image":
+                        store.set_typing(room, AI_NAME, action="painting an image", color=AI_COLOR, ttl_seconds=35.0)
                         generated_attachments.append(
                             generate_image_attachment(
                                 client=st.session_state.client,
@@ -1844,6 +2153,7 @@ if prompt:
                             )
                         )
                     elif media_kind == "video":
+                        store.set_typing(room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0)
                         generated_attachments.append(
                             generate_video_attachment(
                                 client=st.session_state.client,
@@ -1852,9 +2162,13 @@ if prompt:
                                 aspect_ratio=st.session_state.video_aspect_ratio,
                                 store=store,
                                 reference_image=attached_ref_image,
+                                heartbeat_fn=lambda: store.set_typing(
+                                    room, AI_NAME, action="creating a video", color=AI_COLOR, ttl_seconds=35.0
+                                ),
                             )
                         )
                     elif media_kind == "audio":
+                        store.set_typing(room, AI_NAME, action="recording a voice note", color=AI_COLOR, ttl_seconds=35.0)
                         generated_attachments.append(
                             generate_audio_attachment(
                                 client=st.session_state.client,
@@ -1914,4 +2228,7 @@ if prompt:
                     "attachments": reply_attachments,
                 },
             )
+            store.clear_typing(room, AI_NAME)
             st.rerun()
+        finally:
+            store.clear_typing(room, AI_NAME)
